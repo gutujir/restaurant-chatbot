@@ -16,7 +16,13 @@ import {
 import { IMenuItem } from "../models/MenuItem";
 import Order from "../models/Order";
 import { ensureSession } from "../middlewares/session";
-import axios from "axios";
+import {
+  validatePaystackConfig,
+  initializePaystackTransaction,
+  verifyPaystackTransaction,
+  nairaToKobo,
+  PAYSTACK_CONFIG,
+} from "../config/paystack";
 
 export const getMenu = async (_req: Request, res: Response) => {
   await ensureMenuSeeded();
@@ -39,11 +45,23 @@ export const chatHandler = async (req: Request, res: Response) => {
   if (!/^[0-9]+$/.test(inputRaw)) {
     return res.json({
       sid,
-      message: "Invalid input. Please enter numbers only.",
+      message:
+        "Invalid input. Please enter numbers only.\n\n" + options.join("\n"),
       options,
     });
   }
   const input = parseInt(inputRaw, 10);
+
+  // Validate number range
+  if (input < 0 || input > 1000) {
+    return res.json({
+      sid,
+      message:
+        "Invalid selection. Please choose a valid option.\n\n" +
+        options.join("\n"),
+      options,
+    });
+  }
 
   switch (input) {
     case 1: {
@@ -65,23 +83,39 @@ export const chatHandler = async (req: Request, res: Response) => {
         return res.json({
           sid,
           ...result,
-          message: `${result.message}. Use "Pay with Paystack" to complete payment. Reference: ${result.reference}`,
+          message: `${result.message}! 🎉\n\nTotal: ₦${result.total}\nReference: ${result.reference}\n\nUse "Pay with Paystack" button to complete payment.\n\nAfter payment, you can:\n• Select 1 to place a new order\n• Select 98 to see order history`,
           payReference: result.reference,
         });
       }
-      return res.json({ sid, ...result, options });
+      return res.json({
+        sid,
+        ...result,
+        message: result.message + "\n\n" + options.join("\n"),
+        options,
+      });
     }
     case 98: {
       const history = await getOrderHistory(sid);
-      return res.json({ sid, history });
+      const message =
+        history.length > 0
+          ? `You have ${history.length} order(s) in your history.`
+          : "No order history yet. Select 1 to place your first order!";
+      return res.json({ sid, history, message });
     }
     case 97: {
       const current = await getCurrentOrder(sid);
-      return res.json({ sid, current });
+      const message =
+        current.items && current.items.length > 0
+          ? `Your current order has ${current.items.length} item(s). Total: ₦${current.total}`
+          : "Your cart is empty. Select 1 to browse the menu!";
+      return res.json({ sid, current, message });
     }
     case 0: {
       const result = await cancelCurrentOrder(sid);
-      return res.json({ sid, ...result });
+      const message = result.message.includes("No current order")
+        ? result.message + " Select 1 to start a new order."
+        : result.message + " ✓\n\nSelect 1 to place a new order.";
+      return res.json({ sid, message, options });
     }
     default: {
       // Treat as item selection (code corresponds to menu item code)
@@ -89,14 +123,17 @@ export const chatHandler = async (req: Request, res: Response) => {
       if (!item) {
         return res.json({
           sid,
-          message: "Invalid selection. Choose from the menu options.",
+          message:
+            "Invalid selection. That item doesn't exist.\n\nSelect 1 to see the menu, or choose from these options:\n" +
+            options.join("\n"),
+          options,
         });
       }
       await addItemToCurrentOrder(sid, item._id);
       const current = await getCurrentOrder(sid);
       return res.json({
         sid,
-        message: `${item.name} added to your order.`,
+        message: `✓ ${item.name} added to your order (₦${item.price})\n\nCurrent total: ₦${current.total}\n\nContinue adding items or select 99 to checkout.`,
         current,
       });
     }
@@ -107,9 +144,11 @@ export const initializePayment = async (req: Request, res: Response) => {
   const sid = await ensureSession(req, res);
   const { reference } = req.body || {};
 
-  const secret = process.env.PAYSTACK_SECRET_KEY;
-  if (!secret)
-    return res.status(500).json({ message: "PAYSTACK_SECRET_KEY missing" });
+  // Validate Paystack configuration
+  const configValidation = validatePaystackConfig();
+  if (!configValidation.isValid) {
+    return res.status(500).json({ message: configValidation.error });
+  }
 
   try {
     const order = reference
@@ -139,29 +178,29 @@ export const initializePayment = async (req: Request, res: Response) => {
         .status(400)
         .json({ message: "Order already paid", reference: order.reference });
     if (order.status !== "placed")
-      return res
-        .status(400)
-        .json({
-          message: `Order is not ready for payment (status: ${order.status})`,
-        });
+      return res.status(400).json({
+        message: `Order is not ready for payment (status: ${order.status})`,
+      });
 
-    const initRes = await axios.post(
-      "https://api.paystack.co/transaction/initialize",
-      {
-        amount: Math.round(order.total * 100),
-        email: `${sid}@example.local`,
-        reference: order.reference,
-        callback_url: `${process.env.CLIENT_URL}/chat?paid=1&ref=${order.reference}`,
-      },
-      { headers: { Authorization: `Bearer ${secret}` } },
-    );
+    // Ensure reference exists (it should always exist at this point)
+    if (!order.reference) {
+      order.reference = `${sid}-${Date.now()}`;
+    }
+
+    // Initialize Paystack transaction
+    const paystackResponse = await initializePaystackTransaction({
+      amount: nairaToKobo(order.total),
+      email: `${sid}@example.local`,
+      reference: order.reference, // Now guaranteed to be string
+      callbackUrl: `${PAYSTACK_CONFIG.callbackUrl}/chat?paid=1&ref=${order.reference}`,
+    });
 
     // persist any new reference/status changes made above
     await order.save();
 
     return res.json({
-      authorizationUrl: initRes.data?.data?.authorization_url,
-      accessCode: initRes.data?.data?.access_code,
+      authorizationUrl: paystackResponse.authorizationUrl,
+      accessCode: paystackResponse.accessCode,
       reference: order.reference,
       message: "Proceed to Paystack to complete your payment.",
     });
@@ -173,24 +212,27 @@ export const initializePayment = async (req: Request, res: Response) => {
 
 export const verifyPayment = async (req: Request, res: Response) => {
   const reference = String(req.query.reference || "");
-  const secret = process.env.PAYSTACK_SECRET_KEY;
-  if (!reference || !secret)
-    return res.status(400).json({ message: "Missing reference or secret" });
+
+  // Validate Paystack configuration
+  const configValidation = validatePaystackConfig();
+  if (!configValidation.isValid) {
+    return res.status(500).json({ message: configValidation.error });
+  }
+
+  if (!reference) {
+    return res.status(400).json({ message: "Missing payment reference" });
+  }
+
   try {
     const order = await getOrderByReference(reference);
     if (!order) return res.status(404).json({ message: "Order not found" });
     if (order.status === "paid")
       return res.json({ message: "Order already paid", status: "paid" });
 
-    const verifyRes = await axios.get(
-      `https://api.paystack.co/transaction/verify/${reference}`,
-      {
-        headers: { Authorization: `Bearer ${secret}` },
-      },
-    );
+    // Verify transaction with Paystack
+    const paystackResponse = await verifyPaystackTransaction(reference);
 
-    const status = verifyRes.data?.data?.status;
-    if (status === "success") {
+    if (paystackResponse.status === "success") {
       await markOrderPaid(reference);
       return res.json({
         message: "Payment verified",
@@ -198,7 +240,10 @@ export const verifyPayment = async (req: Request, res: Response) => {
         reference,
       });
     }
-    return res.status(400).json({ message: "Payment not successful", status });
+    return res.status(400).json({
+      message: "Payment not successful",
+      status: paystackResponse.status,
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return res.status(500).json({ message });

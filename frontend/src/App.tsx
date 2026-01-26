@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 type ChatMessage = {
@@ -85,14 +85,62 @@ function App() {
         const data = await res.json();
         setMenu(data.menu || []);
       }
-    } catch (err) {
-      console.error(err);
+    } catch {
+      console.error("Failed to fetch menu");
     }
   };
 
+  const verifyPaymentByRef = useCallback(async (reference: string) => {
+    try {
+      const res = await fetch(
+        `${API_URL}/api/pay/verify?reference=${reference}`,
+        {
+          credentials: "include",
+        },
+      );
+      const data = await res.json();
+      if (data?.status === "paid") {
+        setPaymentStatus("paid");
+        appendMessage({
+          id: crypto.randomUUID(),
+          role: "bot",
+          text: "🎉 Payment verified successfully! Your order has been confirmed.",
+        });
+        // Refresh current order to show updated status
+        setTimeout(() => sendInput("97"), 500);
+      } else {
+        appendMessage({
+          id: crypto.randomUUID(),
+          role: "bot",
+          text: data?.message || "Payment not completed",
+        });
+      }
+    } catch {
+      appendMessage({
+        id: crypto.randomUUID(),
+        role: "bot",
+        text: "Verification failed.",
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     fetchMenu();
-  }, []);
+    // Check if returning from payment
+    const urlParams = new URLSearchParams(window.location.search);
+    const paid = urlParams.get("paid");
+    const ref = urlParams.get("ref");
+    if (paid === "1" && ref) {
+      setPaymentRef(ref);
+      // Auto-verify payment
+      setTimeout(() => {
+        verifyPaymentByRef(ref);
+      }, 1000);
+      // Clean URL
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+  }, [verifyPaymentByRef]);
 
   useEffect(() => {
     scrollToBottom();
@@ -128,7 +176,13 @@ function App() {
         text: data?.message || "Done",
       });
       if (data?.menu) setMenu(data.menu);
-    } catch (err) {
+
+      // Auto-refresh current order after adding an item (codes 10+)
+      const inputNum = parseInt(trimmed, 10);
+      if (inputNum >= 10 && inputNum < 99 && data?.current) {
+        // Item was added, current order already updated
+      }
+    } catch {
       appendMessage({
         id: crypto.randomUUID(),
         role: "bot",
@@ -163,7 +217,7 @@ function App() {
           text: data?.message || "Unable to start payment",
         });
       }
-    } catch (err) {
+    } catch {
       appendMessage({
         id: crypto.randomUUID(),
         role: "bot",
@@ -196,7 +250,7 @@ function App() {
           text: data?.message || "Payment not completed",
         });
       }
-    } catch (err) {
+    } catch {
       appendMessage({
         id: crypto.randomUUID(),
         role: "bot",
@@ -300,9 +354,35 @@ function App() {
             <button
               onClick={() => sendInput(input)}
               disabled={!input || loading}
-              className="px-5 py-3 rounded-2xl bg-indigo-600 text-white font-semibold shadow-lg hover:bg-indigo-500 disabled:opacity-50"
+              className="px-5 py-3 rounded-2xl bg-indigo-600 text-white font-semibold shadow-lg hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
             >
-              Send
+              {loading ? (
+                <span className="flex items-center gap-2">
+                  <svg
+                    className="animate-spin h-4 w-4"
+                    xmlns="http://www.w3.org/2000/svg"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                  >
+                    <circle
+                      className="opacity-25"
+                      cx="12"
+                      cy="12"
+                      r="10"
+                      stroke="currentColor"
+                      strokeWidth="4"
+                    ></circle>
+                    <path
+                      className="opacity-75"
+                      fill="currentColor"
+                      d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                    ></path>
+                  </svg>
+                  Sending...
+                </span>
+              ) : (
+                "Send"
+              )}
             </button>
           </div>
           <div className="mt-3 flex flex-wrap gap-2 sm:hidden">
